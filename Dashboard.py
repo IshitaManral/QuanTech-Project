@@ -274,21 +274,121 @@ except Exception as e:  # noqa: BLE001
     st.error(f"Could not read the Excel file: {e}")
     st.stop()
 
+# ---- Beginner-friendly hints, calculated from the uploaded data ----
+_n_emp, _n_days = len(data["ids"]), len(data["days"])
+_prod = data["cap"][data["cap"] > 0]
+_avg_prod = float(_prod.mean()) if len(_prod) else 1.0
+_need_shifts = data["plan"] / _avg_prod            # shifts needed to hit the plan at average productivity
+_need_per_day = _need_shifts / _n_days             # average people needed per day
+_need_per_person = _need_shifts / _n_emp           # fair share of shifts per person
+
+
+def weekly_cap(days_in_month, per_week):
+    """Most shifts one person can work in the month if at most `per_week` days in any 7 are allowed."""
+    return (days_in_month // 7) * per_week + min(days_in_month % 7, per_week)
+
+
+def explain_conflicts(p):
+    """Plain-English reasons why a combination of settings cannot work."""
+    msgs = []
+    if p["min_shifts"] > p["max_shifts"]:
+        msgs.append("**Min shifts per person** is higher than **Max shifts per person**. "
+                    "The minimum must be less than or equal to the maximum.")
+    wc = weekly_cap(_n_days, p["max_days_in_7"])
+    if p["min_shifts"] > wc:
+        msgs.append(f"**Min shifts per person ({p['min_shifts']})** cannot be reached: with at most "
+                    f"{p['max_days_in_7']} working days in any 7, one person can work about {wc} days in a "
+                    f"{_n_days}-day month. Lower the minimum or raise 'Max working days in any 7'.")
+    if p["min_staff"] > _n_emp:
+        msgs.append(f"**Minimum people per day ({p['min_staff']})** is more than the {_n_emp} employees you have.")
+    elif _n_emp * min(p["max_shifts"], wc) < _n_days * p["min_staff"]:
+        msgs.append("There are not enough shifts to keep the **minimum people per day** on duty. "
+                    "Lower that minimum, or raise the max shifts / max working days in any 7.")
+    return msgs
+
+
+with st.sidebar.expander("ℹ️ What do these settings mean?"):
+    st.markdown(
+        f"""
+**Quick facts from your data**
+- {_n_emp} employees, {_n_days} days
+- The monthly plan needs about **{_need_per_day:.0f} people per day** on average
+  (about **{_need_per_person:.0f} shifts per person** for the month)
+
+**How it works:** the optimiser picks who works on which day so the plan is covered
+at the **lowest total cost**, while following every rule below.
+
+**Rules of thumb**
+- **Safety cushion:** 1.00 = just enough. 1.10 = 10% spare capacity. Usually 1.00 to 1.15.
+- **Minimum people per day:** keep it at or below the average need above.
+  Higher values add cost on quiet days.
+- **Min / max shifts per person:** keep the minimum at or below the fair share above.
+  Raising it forces extra shifts and extra cost.
+- **Max days in any 7:** 6 means everyone gets at least one day off a week.
+- **Max in a row:** 5 or 6 is typical. Lower = more rest, but a harder puzzle.
+- **Wage and shift hours** only change the cost numbers, not who is scheduled.
+- **Solver time:** 60 s for quick tests, 180 to 300 s for your final answer.
+"""
+    )
+
 with st.sidebar.form("params"):
-    st.subheader("Scenario")
-    buffer = st.slider("Service buffer", 0.80, 1.50, 1.00, 0.05,
-                       help="1.00 = cover exactly the plan. 1.10 = 10% safety margin.")
-    min_staff = st.slider("Minimum staff per day", 0, 40, 10)
+    st.subheader("Workload rules")
+    buffer = st.slider(
+        "Safety cushion (buffer)", 0.80, 1.50, 1.00, 0.05,
+        help="How much extra capacity to schedule on top of the monthly plan.\n\n"
+             "1.00 = schedule just enough people to hit the plan.\n"
+             "1.10 = 10% spare, to absorb absences or busy days.\n"
+             "Below 1.00 = deliberately under-staffed.\n\n"
+             "Typical range: 1.00 to 1.15. Higher = safer but costs more.")
+    min_staff = st.slider(
+        "Minimum people per day", 0, 40, 10,
+        help=f"The fewest people allowed on the floor on any day, even a quiet one.\n\n"
+             f"Your plan needs about {_need_per_day:.0f} people per day on average. "
+             f"Keep this at or below that. Going above it forces extra paid shifts on quiet days.\n\n"
+             f"Rule of thumb: around half of the average need.")
+
+    st.subheader("Fairness rules (per person)")
     c1, c2 = st.columns(2)
-    min_shifts = c1.number_input("Min shifts / person", 0, 31, 12)
-    max_shifts = c2.number_input("Max shifts / person", 1, 31, 26)
-    max_days_in_7 = st.slider("Max working days in any 7", 4, 7, 6)
-    max_consec = st.slider("Max consecutive working days", 3, 10, 6)
+    min_shifts = c1.number_input(
+        "Min shifts per person", 0, 31, 12,
+        help=f"Everyone works at least this many days in the month, so nobody is left out.\n\n"
+             f"A fair share is about {_need_per_person:.0f} shifts per person. "
+             f"Setting the minimum above that forces extra shifts and raises cost.")
+    max_shifts = c2.number_input(
+        "Max shifts per person", 1, 31, 26,
+        help=f"Nobody works more than this many days in the month.\n\n"
+             f"Lower = workload is spread more evenly but you need more people on duty. "
+             f"With the weekly-rest rule below, the practical ceiling is about "
+             f"{weekly_cap(_n_days, 6)} days.")
+
+    st.subheader("Rest rules")
+    max_days_in_7 = st.slider(
+        "Max working days in any 7", 4, 7, 6,
+        help="Looking at any 7 days in a row, nobody works more than this many.\n\n"
+             "6 = at least one day off every week (common choice).\n"
+             "5 = two days off every week.\n"
+             "7 = no weekly rest required.")
+    max_consec = st.slider(
+        "Max days in a row", 3, 10, 6,
+        help="The longest streak of consecutive working days allowed.\n\n"
+             "5 or 6 is typical. Lower = more rest for staff, but the optimiser "
+             "has less freedom and may need more people or more time.")
+
     st.subheader("Cost")
     c3, c4 = st.columns(2)
-    wage = c3.number_input("Wage (Rs/hour)", 10, 1000, 100, 10)
-    shift_hours = c4.number_input("Shift hours", 1, 12, 8)
-    time_limit = st.slider("Solver time limit (s)", 10, 300, 60, 10)
+    wage = c3.number_input(
+        "Wage (Rs/hour)", 10, 1000, 100, 10,
+        help="Hourly pay, same for everyone. Only changes the cost figures, not who works when.")
+    shift_hours = c4.number_input(
+        "Hours per shift", 1, 12, 8,
+        help="Length of one shift. Only changes the cost figures, not who works when.")
+
+    st.subheader("Solver")
+    time_limit = st.slider(
+        "Solver time limit (s)", 10, 300, 60, 10,
+        help="How long the optimiser may search for the cheapest schedule.\n\n"
+             "60 s is fine for quick tests. If you see 'time limit reached', "
+             "try 180 to 300 s for a better or proven-best result.")
     submitted = st.form_submit_button("▶ Run optimiser", type="primary")
 
 params = dict(buffer=float(buffer), min_staff=int(min_staff), min_shifts=int(min_shifts),
@@ -300,8 +400,10 @@ if "runs" not in st.session_state:
 
 need_first_run = "result" not in st.session_state or st.session_state.get("file_key") != file_key
 if need_first_run or submitted:
-    if params["min_shifts"] > params["max_shifts"]:
-        st.error("Min shifts per person cannot be greater than max shifts.")
+    problems = explain_conflicts(params)
+    if problems:
+        for msg in problems:
+            st.error(msg)
         if need_first_run:
             st.stop()
     else:
