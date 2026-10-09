@@ -104,7 +104,7 @@ def load_data(source, file_key):
 # ------------------------------------------------------------------
 # OPTIMISER (same model as the original script)
 # ------------------------------------------------------------------
-@st.cache_data(show_spinner="Solving the integer program (up to the time limit)...")
+@st.cache_data(show_spinner="Solving to proven optimality - this can take a while (tick Quick test mode for a fast check)...")
 def solve(_data, file_key, p):
     cap, days = _data["cap"], _data["days"]
     n, D = len(cap), len(days)
@@ -136,15 +136,44 @@ def solve(_data, file_key, p):
         for s in range(D - p["max_consec"]):
             model += pulp.lpSum(x[i][s:s + p["max_consec"] + 1]) <= p["max_consec"]
 
-    model.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=p["time_limit"]))
+    # Normal run: no time limit, CBC runs until the best schedule is PROVEN.
+    # Quick-test mode: accept any feasible solution within 50% of the bound (usually seconds).
+    gap = 0.5 if p.get("quick") else None
+    model.solve(pulp.PULP_CBC_CMD(msg=False, gapRel=gap))
     status = pulp.LpStatus[model.status]
     if status != "Optimal":
         return dict(status=status, params=p)
 
-    # CBC reports "Optimal" even when it stopped at the time limit with a feasible solution
+    # In quick-test mode CBC stops at the 50% gap, so the result is feasible but not proven cheapest
     proven = getattr(model, "sol_status", 1) == getattr(pulp, "LpSolutionOptimal", 1)
     M = np.array([[int(round(x[i][j].value() or 0)) for j in range(D)] for i in range(n)])
     return dict(status=status, proven=bool(proven), params=p, M=M, demand=demand)
+
+
+def check_constraints(M, cap, demand, p):
+    """Re-verify every rule directly on the roster, independent of the solver."""
+    n, D = M.shape
+    tot = M.sum(axis=1)
+    capday = cap @ M
+    staff = M.sum(axis=0)
+    w7 = [int(M[i, s:s + 7].sum()) for i in range(n) for s in range(D - 6)]
+    run_viol = sum(int(M[i, s:s + p["max_consec"] + 1].sum()) > p["max_consec"]
+                   for i in range(n) for s in range(D - p["max_consec"]))
+    rows = [
+        ("1. Workload covered every day", int((capday < demand - 1e-6).sum()),
+         f"worst shortfall: {max(0.0, float((demand - capday).max())):,.1f} eaches"),
+        ("2. Minimum people per day", int((staff < p["min_staff"]).sum()),
+         f"lowest day: {int(staff.min())} (min {p['min_staff']})"),
+        ("3a. Min shifts per person", int((tot < p["min_shifts"]).sum()),
+         f"lowest: {int(tot.min())} (min {p['min_shifts']})"),
+        ("3b. Max shifts per person", int((tot > p["max_shifts"]).sum()),
+         f"highest: {int(tot.max())} (max {p['max_shifts']})"),
+        ("4. Max days in any 7-day window", int(sum(v > p["max_days_in_7"] for v in w7)),
+         f"highest window: {max(w7) if w7 else 0} (max {p['max_days_in_7']})"),
+        ("5. Max consecutive days", int(run_viol), f"limit {p['max_consec']}"),
+    ]
+    return pd.DataFrame([{"Constraint": a, "Violations": b, "Detail": c, "Result": "PASS" if b == 0 else "FAIL"}
+                         for a, b, c in rows])
 
 
 # ------------------------------------------------------------------
@@ -307,6 +336,150 @@ def explain_conflicts(p):
     return msgs
 
 
+# >>> AUTO-ADJUST
+import itertools
+
+CKEYS = ["buffer", "min_staff", "min_shifts", "max_shifts", "max_days_in_7", "max_consec"]
+DEFAULTS = dict(buffer=1.00, min_staff=10, min_shifts=12, max_shifts=26, max_days_in_7=6, max_consec=6)
+BOUNDS = dict(buffer=(0.80, 1.50), min_staff=(0, 40), min_shifts=(0, 31), max_shifts=(1, 31),
+              max_days_in_7=(4, 7), max_consec=(3, 10))
+LABELS = dict(buffer="Safety cushion", min_staff="Min people/day", min_shifts="Min shifts/person",
+              max_shifts="Max shifts/person", max_days_in_7="Max days in any 7", max_consec="Max days in a row")
+_DEMAND_SHAPE = data["actual_by_day"] / data["actual_by_day"].sum()
+
+
+def eff_max(p):
+    """Most shifts one person can really work given the max-shifts, weekly-rest and consecutive-day rules."""
+    D, c = _n_days, p["max_consec"]
+    consec_cap = (D // (c + 1)) * c + min(D % (c + 1), c)
+    return min(p["max_shifts"], weekly_cap(D, p["max_days_in_7"]), consec_cap, D)
+
+
+def find_issue(p):
+    """Return the first reason the settings cannot work (fast arithmetic checks, no solver)."""
+    em = eff_max(p)
+    if p["min_shifts"] > em:
+        return "min_shifts"
+    if p["min_staff"] > _n_emp or _n_emp * em < _n_days * p["min_staff"]:
+        return "min_staff"
+    demand = p["buffer"] * data["plan"] * _DEMAND_SHAPE
+    if data["cap"].sum() * em < demand.sum():
+        return "capacity"
+    if data["cap"].sum() < demand.max():
+        return "peak"
+    return None
+
+
+_LADDERS = {  # what to loosen first, per problem (least harmful first)
+    "min_shifts": [("min_shifts", -1), ("max_shifts", 1), ("max_consec", 1), ("max_days_in_7", 1)],
+    "min_staff": [("max_shifts", 1), ("min_staff", -1), ("max_consec", 1), ("max_days_in_7", 1)],
+    "capacity": [("max_shifts", 1), ("max_consec", 1), ("max_days_in_7", 1), ("buffer", -0.05)],
+    "peak": [("buffer", -0.05)],
+}
+_REDUCERS = ("min_shifts", "min_staff", "buffer")
+
+
+def _step(p, key, delta):
+    lo, hi = BOUNDS[key]
+    v = p[key] + delta
+    v = round(v, 2) if key == "buffer" else int(v)
+    if v < lo or v > hi:
+        return None
+    q = dict(p)
+    q[key] = v
+    return q
+
+
+def _describe(old, new):
+    out = []
+    for k in CKEYS:
+        if old[k] != new[k]:
+            a = f"{old[k]:.2f}" if k == "buffer" else old[k]
+            b = f"{new[k]:.2f}" if k == "buffer" else new[k]
+            out.append(f"{LABELS[k]}: {a} -> {b}")
+    return out
+
+
+REASON = dict(
+    min_shifts="the **minimum shifts per person** cannot be reached under the rest rules",
+    min_staff="the **minimum people per day** cannot be staffed with these shift limits",
+    capacity="the people available cannot cover the monthly workload with these limits",
+    peak="even everyone working on the busiest day cannot cover its workload")
+
+
+def repair(p, locked):
+    """Loosen only the settings the user did NOT just change, as little as needed, until the combination can work.
+    Returns (settings, change_log, unresolved_issue)."""
+    q = dict(p)
+    for _ in range(60):
+        issue = find_issue(q)
+        if issue is None:
+            break
+        cands = [(k, d) for k, d in _LADDERS[issue] if k not in locked]
+        first = [c for c in cands if c[0] != "buffer"]
+        nq = None
+        for k, d in first:                       # 1 notch of one setting
+            t = _step(q, k, d)
+            if t is not None and (k in _REDUCERS or eff_max(t) > eff_max(q)):
+                nq = t
+                break
+        if nq is None:                           # two rules bind together: loosen 2-3 at once
+            loosen = [c for c in first if c[0] not in _REDUCERS]
+            for depth in (2, 3):
+                for combo in itertools.product(loosen, repeat=depth):
+                    t = q
+                    for k, d in combo:
+                        t = _step(t, k, d) if t is not None else None
+                    if t is not None and eff_max(t) > eff_max(q):
+                        nq = t
+                        break
+                if nq is not None:
+                    break
+        if nq is None:                           # last resort: lower the safety cushion
+            for k, d in cands:
+                if k == "buffer":
+                    nq = _step(q, k, d)
+        if nq is None:
+            break
+        q = nq
+    issue = find_issue(q)
+    if issue:
+        return dict(p), [], issue
+    return q, _describe(p, q), None
+
+
+_FALLBACK = [("min_shifts", -2), ("max_consec", 1), ("max_days_in_7", 1), ("max_shifts", 2),
+             ("min_staff", -2), ("buffer", -0.05)]
+
+
+def relax_once(p, locked):
+    """Used when the solver still says 'infeasible': loosen one more unlocked setting by a notch."""
+    for key, delta in _FALLBACK:
+        if key in locked:
+            continue
+        nq = _step(p, key, delta)
+        if nq is not None:
+            return nq, _describe(p, nq)
+    return None, []
+
+
+def settings_table(requested, used, locked):
+    """One row per constraint: what you set, what was used, and why they differ."""
+    rows = []
+    for k in CKEYS:
+        fmt = (lambda v: f"{v:.2f}") if k == "buffer" else (lambda v: str(v))
+        if requested[k] != used[k]:
+            status = "🔧 Auto-adjusted"
+        elif k in locked:
+            status = "✏️ Changed by you (kept)"
+        else:
+            status = "unchanged"
+        rows.append({"Setting": LABELS[k], "You set": fmt(requested[k]), "Used in run": fmt(used[k]),
+                     "Status": status})
+    return pd.DataFrame(rows)
+# <<< AUTO-ADJUST
+
+
 with st.sidebar.expander("ℹ️ What do these settings mean?"):
     st.markdown(
         f"""
@@ -327,21 +500,26 @@ at the **lowest total cost**, while following every rule below.
 - **Max days in any 7:** 6 means everyone gets at least one day off a week.
 - **Max in a row:** 5 or 6 is typical. Lower = more rest, but a harder puzzle.
 - **Wage and shift hours** only change the cost numbers, not who is scheduled.
-- **Solver time:** 60 s for quick tests, 180 to 300 s for your final answer.
+- **Quick test mode:** seconds, valid schedule but not the cheapest. Untick it for the final answer (no time limit: it runs until the best schedule is proven).
 """
     )
+
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault("w_" + _k, _v)
+if "pending_widgets" in st.session_state:          # apply values the optimiser adjusted last run
+    st.session_state.update(st.session_state.pop("pending_widgets"))
 
 with st.sidebar.form("params"):
     st.subheader("Workload rules")
     buffer = st.slider(
-        "Safety cushion (buffer)", 0.80, 1.50, 1.00, 0.05,
+        "Safety cushion (buffer)", 0.80, 1.50, step=0.05, key="w_buffer",
         help="How much extra capacity to schedule on top of the monthly plan.\n\n"
              "1.00 = schedule just enough people to hit the plan.\n"
              "1.10 = 10% spare, to absorb absences or busy days.\n"
              "Below 1.00 = deliberately under-staffed.\n\n"
              "Typical range: 1.00 to 1.15. Higher = safer but costs more.")
     min_staff = st.slider(
-        "Minimum people per day", 0, 40, 10,
+        "Minimum people per day", 0, 40, key="w_min_staff",
         help=f"The fewest people allowed on the floor on any day, even a quiet one.\n\n"
              f"Your plan needs about {_need_per_day:.0f} people per day on average. "
              f"Keep this at or below that. Going above it forces extra paid shifts on quiet days.\n\n"
@@ -350,12 +528,12 @@ with st.sidebar.form("params"):
     st.subheader("Fairness rules (per person)")
     c1, c2 = st.columns(2)
     min_shifts = c1.number_input(
-        "Min shifts per person", 0, 31, 12,
+        "Min shifts per person", 0, 31, key="w_min_shifts",
         help=f"Everyone works at least this many days in the month, so nobody is left out.\n\n"
              f"A fair share is about {_need_per_person:.0f} shifts per person. "
              f"Setting the minimum above that forces extra shifts and raises cost.")
     max_shifts = c2.number_input(
-        "Max shifts per person", 1, 31, 26,
+        "Max shifts per person", 1, 31, key="w_max_shifts",
         help=f"Nobody works more than this many days in the month.\n\n"
              f"Lower = workload is spread more evenly but you need more people on duty. "
              f"With the weekly-rest rule below, the practical ceiling is about "
@@ -363,16 +541,16 @@ with st.sidebar.form("params"):
 
     st.subheader("Rest rules")
     max_days_in_7 = st.slider(
-        "Max working days in any 7", 4, 7, 6,
+        "Max working days in any 7", 4, 7, key="w_max_days_in_7",
         help="Looking at any 7 days in a row, nobody works more than this many.\n\n"
              "6 = at least one day off every week (common choice).\n"
              "5 = two days off every week.\n"
              "7 = no weekly rest required.")
     max_consec = st.slider(
-        "Max days in a row", 3, 10, 6,
+        "Max days in a row", 3, 10, key="w_max_consec",
         help="The longest streak of consecutive working days allowed.\n\n"
              "5 or 6 is typical. Lower = more rest for staff, but the optimiser "
-             "has less freedom and may need more people or more time.")
+             "has less freedom and may need more people or take longer to solve.")
 
     st.subheader("Cost")
     c3, c4 = st.columns(2)
@@ -384,39 +562,63 @@ with st.sidebar.form("params"):
         help="Length of one shift. Only changes the cost figures, not who works when.")
 
     st.subheader("Solver")
-    time_limit = st.slider(
-        "Solver time limit (s)", 10, 300, 60, 10,
-        help="How long the optimiser may search for the cheapest schedule.\n\n"
-             "60 s is fine for quick tests. If you see 'time limit reached', "
-             "try 180 to 300 s for a better or proven-best result.")
+    quick = st.checkbox("Quick test mode (first decent solution, ~seconds)", value=False,
+                        help="Stops early with a feasible but not necessarily cheapest schedule. "
+                             "Great for checking that the constraints work. Untick for the final run.")
+    auto_adjust = st.checkbox("Auto-adjust other settings", value=True,
+                              help="Change one setting and press Run: that one stays exactly as you set it, and "
+                                   "the others are loosened only as much as needed to give a feasible, "
+                                   "cost-optimal schedule. The sidebar then shows the new values.")
     submitted = st.form_submit_button("▶ Run optimiser", type="primary")
 
 params = dict(buffer=float(buffer), min_staff=int(min_staff), min_shifts=int(min_shifts),
               max_shifts=int(max_shifts), max_days_in_7=int(max_days_in_7), max_consec=int(max_consec),
-              wage=int(wage), shift_hours=int(shift_hours), time_limit=int(time_limit))
+              wage=int(wage), shift_hours=int(shift_hours), quick=bool(quick))
 
 if "runs" not in st.session_state:
     st.session_state.runs = []
 
 need_first_run = "result" not in st.session_state or st.session_state.get("file_key") != file_key
 if need_first_run or submitted:
+    locked, adjustments, stuck = set(), [], None
+    requested = {k: params[k] for k in CKEYS}
+    if auto_adjust:
+        last = st.session_state.get("last_params")
+        if last and st.session_state.get("file_key") == file_key:
+            locked = {k for k in CKEYS if last.get(k) != params[k]}   # what the user just changed
+        params, adjustments, stuck = repair(params, locked)
     problems = explain_conflicts(params)
+    if auto_adjust and stuck:
+        problems.append("Auto-adjust could not make this work without changing the setting you just set: "
+                        + REASON[stuck] + ". Relax the setting you changed, or turn off 'Auto-adjust other settings'.")
     if problems:
         for msg in problems:
             st.error(msg)
+        st.dataframe(settings_table(requested, params, locked), hide_index=True)
         if need_first_run:
             st.stop()
     else:
         res = solve(data, file_key, params)
+        tries = 0
+        while auto_adjust and res["status"] != "Optimal" and tries < 4:   # solver still infeasible: loosen a notch
+            nxt, step = relax_once(params, locked)
+            if nxt is None:
+                break
+            params, adjustments, tries = nxt, adjustments + step, tries + 1
+            res = solve(data, file_key, params)
         if res["status"] != "Optimal":
             st.error(f"Solver status: **{res['status']}** - no schedule found. Relax the constraints "
                      "(lower the buffer or min staff, or raise max shifts) and run again.")
+            st.dataframe(settings_table(requested, params, locked), hide_index=True)
             if need_first_run:
                 st.stop()
         else:
             if st.session_state.get("file_key") != file_key:
                 st.session_state.runs = []
             st.session_state.result, st.session_state.file_key = res, file_key
+            st.session_state.last_params = {k: params[k] for k in CKEYS}
+            st.session_state.adjust_log = adjustments
+            st.session_state.run_table = settings_table(requested, params, locked)
             st.session_state.pop("png", None)
             M = res["M"]
             hist_cost = int(data["hist"].sum()) * params["wage"] * params["shift_hours"]
@@ -427,6 +629,9 @@ if need_first_run or submitted:
                 "Max shifts": params["max_shifts"], "Shifts": int(M.sum()), "Cost (Rs)": cost,
                 "Savings (Rs)": hist_cost - cost,
             })
+            if adjustments:   # refresh the sidebar so it shows the adjusted values
+                st.session_state.pending_widgets = {"w_" + k: params[k] for k in CKEYS}
+                st.rerun()
 
 # ------------------------------------------------------------------
 # DERIVED RESULTS
@@ -459,16 +664,31 @@ emp = pd.DataFrame({
 })
 emp["Change"] = emp["Shifts (optimised)"] - emp["Shifts (historical)"]
 
+checks = check_constraints(M, cap, demand, P)
+
 # ------------------------------------------------------------------
 # HEADER + KPIs
 # ------------------------------------------------------------------
 st.title("📊 Workforce Scheduling Dashboard")
-solver_txt = "Optimal" if res.get("proven", True) else "Best found (time limit reached)"
+solver_txt = "Optimal (proven)" if res.get("proven", True) and not P.get("quick") else "Quick test (not cost-optimised)"
 st.caption(f"{n} employees  |  {D} days  |  monthly plan {data['plan']:,.0f} eaches  |  "
            f"buffer {P['buffer']:.2f}  |  solver: {solver_txt}")
-if not res.get("proven", True):
-    st.warning("The solver hit the time limit before proving optimality. The schedule is valid, but may cost "
-               "slightly more than the true optimum. Raise the solver time limit to tighten it.")
+_tbl = st.session_state.get("run_table")
+if _tbl is not None:
+    _adj = st.session_state.get("adjust_log") or []
+    with st.expander("⚙️ Settings used in this run" + (f"  -  {len(_adj)} auto-adjusted" if _adj else ""),
+                     expanded=bool(_adj)):
+        st.dataframe(_tbl, hide_index=True)
+        if _adj:
+            st.markdown("**What was changed automatically:**\n\n- " + "\n- ".join(_adj))
+        else:
+            st.caption("No settings needed adjusting.")
+if (checks["Result"] == "FAIL").any():
+    st.error("Constraint check FAILED - see 'Data & export' > Constraint check.")
+else:
+    st.success("All 5 constraint groups verified on the final roster.")
+if P.get("quick"):
+    st.info("Quick test mode: the schedule is valid but not necessarily the cheapest. Untick it for the final run.")
 
 # Two rows of three cards so values and deltas are not truncated
 row1 = st.columns(3)
@@ -646,6 +866,9 @@ with tab4:
 with tab5:
     roster_df = pd.DataFrame(M, columns=days, index=labels)
     roster_df["Total Shifts"] = roster_df.sum(axis=1)
+
+    st.subheader("Constraint check")
+    st.dataframe(checks, hide_index=True)
 
     st.subheader("Daily coverage")
     st.dataframe(coverage, hide_index=True)
