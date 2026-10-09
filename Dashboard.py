@@ -23,6 +23,22 @@ import streamlit as st
 
 st.set_page_config(page_title="Workforce Scheduling Dashboard", page_icon="📊", layout="wide")
 
+# Make KPI cards readable: smaller value text, no "..." truncation
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetricValue"] { font-size: 1.6rem; }
+    [data-testid="stMetricValue"] > div,
+    [data-testid="stMetricDelta"] > div {
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 BLUE, ORANGE, GREEN, RED, GREY = "#2563EB", "#F97316", "#16A34A", "#DC2626", "#64748B"
 TEMPLATE = "plotly_white"
 
@@ -352,14 +368,19 @@ if not res.get("proven", True):
     st.warning("The solver hit the time limit before proving optimality. The schedule is valid, but may cost "
                "slightly more than the true optimum. Raise the solver time limit to tighten it.")
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+# Two rows of three cards so values and deltas are not truncated
+row1 = st.columns(3)
+row2 = st.columns(3)
+k1, k2, k3 = row1
+k4, k5, k6 = row2
+
 metric(k1, "Optimised cost", f"Rs {cost_opt:,}", f"{cost_opt - cost_hist:,} vs historical", delta_color="inverse")
 metric(k2, "Historical cost", f"Rs {cost_hist:,}", f"{hist_shifts:,} shifts", delta_color="off")
 metric(k3, "Savings", f"Rs {saving:,}", f"{100 * saving / cost_hist:.1f}%" if cost_hist else None)
 metric(k4, "Total shifts", f"{total_shifts:,}", f"{total_shifts - hist_shifts:,} vs historical", delta_color="inverse")
 metric(k5, "Avg staff / day", f"{coverage['Staff on duty'].mean():.1f}", f"peak {coverage['Staff on duty'].max()}",
        delta_color="off")
-metric(k6, "Capacity used", f"{utilisation:.1f}%", "no safety margin" if utilisation > 98 else None,
+metric(k6, "Capacity used", f"{utilisation:.1f}%", "no margin" if utilisation > 98 else None,
        delta_color="off")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Employees", "Roster", "Scenarios", "Data & export"])
